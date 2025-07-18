@@ -3,46 +3,34 @@
 namespace App\Http\Controllers;
 
 use App\Http\Requests\LoginRequest;
+use App\Http\Template\Response;
+use App\Http\Template\TokenManagement;
 use App\Models\Client;
-use Carbon\Carbon;
-
+use Carbon\Carbon;;
 use Illuminate\Http\JsonResponse;
-use Jose\Component\Core\AlgorithmManager;
-use Jose\Component\Signature\Algorithm\HS256;
-use Jose\Component\Signature\Algorithm\RS256;
-use Jose\Component\Signature\Algorithm\RS512;
-use Jose\Component\KeyManagement\JWKFactory;
-use Jose\Component\Core\JWK;
-use Jose\Component\Signature\JWSBuilder;
-use Jose\Component\Signature\Serializer\CompactSerializer;
-use JsonException;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\Validator;
 
 class GenerateController extends Controller
 {
-    protected $login;
+    protected TokenManagement $tokenManagement;
+    protected Client $client;
     protected Response $response;
-    protected GenerateToken $generateToken;
-    protected $currentTime;
+    protected Carbon $carbon;
+    protected $privateKey;
 
-    public function __construct(LoginController $login,
-                                GenerateToken $generateToken,
-                                Response $response)
+    public function __construct()
     {
-        $this->login            = $login;
-        $this->response         = $response;
-        $this->currentTime      = Carbon::now();
-        $this->generateToken    = $generateToken;
+        $this->tokenManagement = new TokenManagement();
+        $this->client = new Client();
+        $this->response = new Response();
+        $this->carbon = new Carbon();
+        $this->privateKey = file_get_contents(env('JWT_PRIVATE_KEY'));
     }
 
-    /**
-     * Digunakan sebagai endpoint generate token
-     *
-     * @param LoginRequest $request
-     * @return JsonResponse
-     */
-    public function generateToken(LoginRequest $request)
+    public function generateToken(Request $request)
     {
-        $account = $this->login->attemptLogin($request);
+        $account = $this->attemptLogin($request);
 
         if (!$account) return $this->response->invalidCredentialsResponse();
 
@@ -56,16 +44,39 @@ class GenerateController extends Controller
             $accessModule[] = $item->module->module . '.' . $item->access->desc;
         }
 
-        $accessToken = $this->generateToken->generateAccessToken($account, $accessModule);
-        $refreshToken = $this->generateToken->generateRefreshToken($account);
+        $accessToken = $this->tokenManagement->generateAccessToken($account, $accessModule);
+        $refreshToken = $this->tokenManagement->generateRefreshToken($account);
 
         $dataToken = (object)array(
             'type'          => 'bearer',
             'access_token'  => $accessToken,
             'refresh_token' => $refreshToken,
-            'expired_in'    => $this->currentTime->addMinutes((int)config('api.access_token_duration'))->format('Y-m-d H:i:s'),
+            'expired_in'    => $this->carbon->addMinutes((int)config('api.access_token_duration'))->format('Y-m-d H:i:s'),
         );
 
         return $this->response->grantedTokenResponse($dataToken);
+    }
+
+    /**
+     * @param Request $request
+     * @return false|JsonResponse|mixed
+     */
+    private function attemptLogin(Request $request)
+    {
+        // Validate
+        $validator = Validator::make($request->all(), (new LoginRequest())->rules());
+        if ($validator->fails())
+            return $this->response->badRequestResponse($validator->errors())
+                ->send();
+
+        $username = $request->post('username');
+        $password = $request->post('password');
+
+        $hashPassword = sha1(md5($password));
+        $client = $this->client->getClient($username, $hashPassword);
+
+        if (empty($client)) return false;
+
+        return $client[0];
     }
 }

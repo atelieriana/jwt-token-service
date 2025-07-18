@@ -2,31 +2,31 @@
 
 namespace App\Http\Controllers;
 
+use App\Http\Template\Response;
+use App\Http\Template\TokenManagement;
 use App\Models\Client;
 use Carbon\Carbon;
 use Illuminate\Http\JsonResponse;
 use Illuminate\Http\Request;
-use Jose\Component\Signature\Algorithm\HS256;
-use Jose\Component\Signature\Serializer\CompactSerializer;
-use Jose\Component\KeyManagement\JWKFactory;
-use Jose\Component\Signature\JWSVerifier;
 use Jose\Component\Core\AlgorithmManager;
+use Jose\Component\KeyManagement\JWKFactory;
+use Jose\Component\Signature\Algorithm\HS256;
 use Jose\Component\Signature\Algorithm\RS512;
+use Jose\Component\Signature\JWSVerifier;
+use Jose\Component\Signature\Serializer\CompactSerializer;
 
 class RefreshController extends Controller
 {
     protected Response $response;
     protected Client $client;
-    protected GenerateToken $generateToken;
+    protected TokenManagement $tokenManagement;
     protected $currentTime;
 
-    public function __construct(Client $client,
-                                GenerateToken $generateToken,
-                                Response $response)
+    public function __construct()
     {
-        $this->client           = $client;
-        $this->generateToken    = $generateToken;
-        $this->response         = $response;
+        $this->client           = new Client();
+        $this->tokenManagement  = new TokenManagement();
+        $this->response         = new Response();
         $this->currentTime      = Carbon::now();
     }
 
@@ -53,20 +53,29 @@ class RefreshController extends Controller
         $refreshToken = $rawDataRequest->refresh_token;
 
         // Validate Access Token and Refresh Token
-        $resultValidateAccessToken = $this->validateAccessToken($accessToken);
-        $resultValidateRefreshToken = $this->validateRefreshToken($refreshToken);
+        $resultValidateAccessToken = $this->tokenManagement->validateAccessToken($accessToken);
 
-        if (!$resultValidateAccessToken->status)
+        // Client
+        $dataClient = $this->client->getSecretByHashID($resultValidateAccessToken->client_id);
+
+        $resultValidateRefreshToken = $this->tokenManagement->validateRefreshToken($refreshToken, $dataClient[0]->secret);
+
+        if (!$resultValidateAccessToken->client_id)
             return $this->response->badRequestResponse($resultValidateAccessToken);
-        if (!$resultValidateRefreshToken->status)
-            return $this->response->badRequestResponse($resultValidateRefreshToken->data);
+        if (!$resultValidateRefreshToken->client_id)
+            return $this->response->badRequestResponse($resultValidateRefreshToken);
+
+        // get detail access module dari user login
+        $client = Client::with('detail_modules.module', 'detail_modules.access')
+            ->where('id', $dataClient[0]->id)
+            ->first();
 
         $accessModule = array();
-        foreach($this->client->detail_modules as $item){
+        foreach($client->detail_modules as $item){
             $accessModule[] = $item->module->module . '.' . $item->access->desc;
         }
 
-        $accessToken = $this->generateToken->generateAccessToken($resultValidateRefreshToken, $accessModule);
+        $accessToken = $this->tokenManagement->generateAccessToken($dataClient[0], $accessModule);
         $dataToken = (object)array(
             'type'          => 'bearer',
             'access_token'  => $accessToken,
@@ -75,126 +84,5 @@ class RefreshController extends Controller
         );
 
         return $this->response->grantedTokenResponse($dataToken);
-    }
-
-    /**
-     * Digunakan untuk melakukan validasi access_token
-     *
-     * @param $accessToken
-     * @return object
-     */
-    private function validateAccessToken($accessToken)
-    {
-        $algorithmManager = new AlgorithmManager([
-            new RS512()
-        ]);
-
-        // Verify signature
-        $keyDecryption = JWKFactory::createFromKeyFile(
-            env('JWT_PRIVATE_KEY')
-        );
-
-        $serializer = new CompactSerializer();
-        try
-        {
-            $jsonWebSerializer = $serializer->unserialize($accessToken);
-        }
-        catch (\Exception $exception)
-        {
-            return $this->response->badRequestResponse('Access token is invalid');
-        }
-
-        $jwsVerifier = new JWSVerifier($algorithmManager);
-        try
-        {
-            if(!$jwsVerifier->verifyWithKey($jsonWebSerializer, $keyDecryption,0))
-                return (object)array(
-                    'status'    => true,
-                    'data'      => 'Token invalid'
-                );
-        }
-        catch (\Exception $e)
-        {
-            return (object)array(
-                'status'    => false,
-                'data'      => $e->getMessage()
-            );
-        }
-
-        return (object)array(
-            'status'    => true,
-            'data'      => 'Ok!'
-        );
-    }
-
-    /**
-     * Digunakan untuk melakukan validasi refresh_token
-     *
-     * @param $refreshToken
-     * @return object
-     */
-    private function validateRefreshToken($refreshToken)
-    {
-        $algorithmManager = new AlgorithmManager([
-            new HS256()
-        ]);
-
-        $serializer = new CompactSerializer();
-        try
-        {
-            $jsonWebSerializer = $serializer->unserialize($refreshToken);
-        }
-        catch (\Exception $exception)
-        {
-            return $this->response->badRequestResponse('Refresh token is invalid');
-        }
-
-        $payloadRefreshToken = json_decode($jsonWebSerializer->getPayload());
-        if (!isset($payloadRefreshToken->client_id))
-            return (object)array(
-                'status'    => false,
-                'data'      => 'Data Client ID tidak tersedia pada token'
-            );
-
-        $hashClientId = $payloadRefreshToken->client_id;
-        $clientData = $this->client->getSecretByHashID($hashClientId);
-        $clientSecret = $clientData[0]->secret;
-        $clientId = $clientData[0]->id;
-        $clientApplication = $clientData[0]->application;
-
-        $generateEncryption = JWKFactory::createFromSecret($clientSecret,array(
-            'alg'   => 'HS256',
-            'use'   => 'sig'
-        ));
-
-        $jwsVerify = new JWSVerifier($algorithmManager);
-        try
-        {
-            if(!$jwsVerify->verifyWithKey($jsonWebSerializer,$generateEncryption,0))
-                return (object)array(
-                    'status'    => false,
-                    'data'      => 'Token Invalid'
-                );
-        }
-        catch (\Exception $e)
-        {
-            return (object)array(
-                'status'    => false,
-                'data'      => $e->getMessage()
-            );
-        }
-
-        // Validate if refresh token still have valid date
-        $currentTime = Carbon::now()->unix();
-        if ($payloadRefreshToken->exp < $currentTime) return (object)array(
-            'status'    => false,
-            'data'      => 'Token Expired'
-        );
-
-        return (object)array(
-            'status'        => true,
-            'id'            => $clientId,
-            'application'   => $clientApplication
-        );
     }
 }
